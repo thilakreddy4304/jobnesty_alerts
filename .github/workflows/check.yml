@@ -1,0 +1,52 @@
+name: Check Jobnesty
+
+on:
+  schedule:
+    # Cron is in UTC. 08:00-19:59 UTC is 4am-3:59pm EDT today, and 3am-2:59pm EST
+    # after US clocks change on Nov 1. GitHub may also start scheduled runs late.
+    # Narrow this window once you know when jobs usually land: it saves Actions minutes.
+    - cron: "*/15 8-19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jobnesty-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Check for new jobs
+        env:
+          JN_EMAIL: ${{ secrets.JN_EMAIL }}
+          JN_PASSWORD: ${{ secrets.JN_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python check.py
+
+      - name: Commit seen.json if it changed
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add seen.json
+          if git diff --cached --quiet; then
+            echo "seen.json unchanged"
+          else
+            git commit -m "Update seen.json"
+            git push
+          fi
