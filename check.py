@@ -78,7 +78,7 @@ def extract(page):
     for r in rows:
         m = re.search(r"/api/resume/(\d+)", r["resume"])
         r["key"] = f"resume:{m.group(1)}" if m else r["job_url"]
-    return rows, page.evaluate(PAGINATION_JS)
+    return rows, page.evaluate(PAGINATION_JS), page.query_selector("table") is not None
 
 
 def scrape_once(browser, email, password):
@@ -101,7 +101,11 @@ def scrape_once(browser, email, password):
             raise LoginRejected() from None
         if "/dashboard" not in page.url:
             page.goto(DASHBOARD_URL)
-        page.wait_for_selector(ROW_SELECTOR)
+        page.wait_for_selector("table, main")
+        try:
+            page.wait_for_selector(ROW_SELECTOR, timeout=15_000)
+        except PlaywrightTimeout:
+            pass  # an empty dashboard is legitimate; main() decides what zero rows means
         return extract(page)
     finally:
         context.close()
@@ -170,12 +174,14 @@ def main():
 
     topic = None if args.dry_run else env("NTFY_TOPIC")
     if args.fixture:
-        rows, paginated = scrape_fixture(args.fixture)
+        rows, paginated, has_table = scrape_fixture(args.fixture)
     else:
-        rows, paginated = scrape(env("JN_EMAIL"), env("JN_PASSWORD"))
+        rows, paginated, has_table = scrape(env("JN_EMAIL"), env("JN_PASSWORD"))
 
+    if not has_table:
+        sys.exit("No job table on the dashboard: the login or page markup probably changed")
     if not rows:
-        sys.exit("No job rows found on the dashboard: the login or table selector probably broke")
+        print("Dashboard is empty (logged in fine, no jobs listed yet)")
     if paginated:
         print("WARNING: the dashboard looks paginated. Only the first page is checked, "
               "so jobs that land beyond it will be missed.")
