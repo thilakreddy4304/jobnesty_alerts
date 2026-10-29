@@ -2,11 +2,15 @@ name: Check Jobnesty
 
 on:
   schedule:
-    # Cron is in UTC. 08:00-19:59 UTC is 4am-3:59pm EDT today, and 3am-2:59pm EST
-    # after US clocks change on Nov 1. GitHub may also start scheduled runs late.
-    # Narrow this window once you know when jobs usually land: it saves Actions minutes.
-    - cron: "*/15 8-19 * * *"
-  workflow_dispatch:
+    # Target: 7:00-8:30 AM Eastern, Monday-Friday. GitHub can't schedule more often than every
+    # 5 minutes, so one run starts at 7:00 and check.py --watch reloads the dashboard every
+    # 2 minutes until the first alert or 8:30. The :30 starts are backups in case GitHub drops
+    # one; while a run is watching they queue, then exit at the gate once it finishes.
+    # Cron is UTC and ignores daylight saving, so this fires over both possible UTC windows
+    # (11:00-12:30 UTC during EDT, 12:00-13:30 UTC during EST) and the "Gate" step
+    # skips any start that isn't inside 7:00-8:30 Eastern.
+    - cron: "0,30 11-13 * * 1-5"
+  workflow_dispatch: # manual runs skip the gate, so you can test any time
 
 permissions:
   contents: write
@@ -19,32 +23,56 @@ jobs:
   check:
     runs-on: ubuntu-latest
     environment: jobnest  # the secrets live in this environment
-    timeout-minutes: 10
+    timeout-minutes: 105  # the watch loop ends by 8:30 ET, at most ~90 minutes after a 7:00 start
     steps:
       - uses: actions/checkout@v5
 
+      - name: Gate (Eastern time window, already alerted today)
+        id: gate
+        run: |
+          now=$((10#$(TZ=America/New_York date +%H%M)))
+          today=$(TZ=America/New_York date +%F)
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run: skipping the gate"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$now" -lt 700 ] || [ "$now" -ge 830 ]; then
+            echo "Outside 7:00-8:30 Eastern (now $now), skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "$(cat last_alert.txt 2>/dev/null)" = "$today" ]; then
+            echo "Already alerted today ($today), skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@v6
+        if: steps.gate.outputs.run == 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
       - name: Check for new jobs
+        if: steps.gate.outputs.run == 'true'
         env:
           JN_EMAIL: ${{ secrets.JN_EMAIL }}
           JN_PASSWORD: ${{ secrets.JN_PASSWORD }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python check.py
+        # Scheduled runs watch until the first alert or 8:30 ET; manual runs check once.
+        run: python check.py ${{ github.event_name == 'schedule' && '--watch' || '' }}
 
       - name: Commit seen.json if it changed
+        if: steps.gate.outputs.run == 'true'
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add seen.json
+          [ -f last_alert.txt ] && git add last_alert.txt
           if git diff --cached --quiet; then
             echo "seen.json unchanged"
           else

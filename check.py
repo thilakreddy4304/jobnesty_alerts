@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check the Jobnesty dashboard for new jobs and push one ntfy alert per run.
 
-  python check.py                     # normal run (what GitHub Actions does)
+  python check.py                     # one check (manual GitHub runs)
+  python check.py --watch             # check every 2 min until the first alert or 8:30 ET (scheduled runs)
   python check.py --dry-run           # log in, scrape, print rows; no alert, seen.json untouched
   python check.py --fixture tests/fixture_dashboard.html --dry-run   # parse local HTML, no login
 """
@@ -10,6 +11,9 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -25,8 +29,12 @@ BASE = "https://jobnesty-kikk.onrender.com"
 LOGIN_URL = f"{BASE}/login"
 DASHBOARD_URL = f"{BASE}/dashboard"
 SEEN = "seen.json"
+LAST_ALERT = "last_alert.txt"  # Eastern date of the last alert; the workflow skips the rest of that day
 TIMEOUT_MS = 90_000  # Render free tier cold starts can take 30-60s
 MAX_LISTED = 5
+EASTERN = ZoneInfo("America/New_York")
+WATCH_INTERVAL_S = 120  # --watch: seconds between dashboard reloads
+WATCH_UNTIL = "08:30"   # --watch: stop at this Eastern time if nothing has been alerted
 
 # These login selectors are guesses. Record the real ones with:
 #   playwright codegen https://jobnesty-kikk.onrender.com/login
@@ -81,52 +89,58 @@ def extract(page):
     return rows, page.evaluate(PAGINATION_JS), page.query_selector("table") is not None
 
 
-def scrape_once(browser, email, password):
-    context = browser.new_context()
-    page = context.new_page()
-    page.set_default_timeout(TIMEOUT_MS)
+def login(page, email, password):
+    page.goto(LOGIN_URL)
     try:
-        page.goto(LOGIN_URL)
-        try:
-            # Let Next.js hydrate first; submitting a raw form could put the password in a GET URL.
-            page.wait_for_load_state("networkidle", timeout=30_000)
-        except PlaywrightTimeout:
-            pass
-        page.fill(EMAIL_SELECTOR, email)
-        page.fill(PASSWORD_SELECTOR, password)
-        page.click(SUBMIT_SELECTOR)
-        try:
-            page.wait_for_url(lambda url: "/login" not in url)
-        except PlaywrightTimeout:
-            raise LoginRejected() from None
+        # Let Next.js hydrate first; submitting a raw form could put the password in a GET URL.
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    except PlaywrightTimeout:
+        pass
+    page.fill(EMAIL_SELECTOR, email)
+    page.fill(PASSWORD_SELECTOR, password)
+    page.click(SUBMIT_SELECTOR)
+    try:
+        page.wait_for_url(lambda url: "/login" not in url)
+    except PlaywrightTimeout:
+        raise LoginRejected() from None
+
+
+def load_dashboard(page, email, password):
+    """Open or reload the dashboard, logging in again only if the session has expired."""
+    if "/dashboard" in page.url:
+        page.reload()
+    else:
+        page.goto(DASHBOARD_URL)
+    if "/login" in page.url:
+        print("Session expired, logging in again")
+        login(page, email, password)
         if "/dashboard" not in page.url:
             page.goto(DASHBOARD_URL)
-        page.wait_for_selector("table, main")
-        try:
-            page.wait_for_selector(ROW_SELECTOR, timeout=15_000)
-        except PlaywrightTimeout:
-            pass  # an empty dashboard is legitimate; main() decides what zero rows means
-        return extract(page)
-    finally:
-        context.close()
+    page.wait_for_selector("table, main")
+    try:
+        page.wait_for_selector(ROW_SELECTOR, timeout=15_000)
+    except PlaywrightTimeout:
+        pass  # an empty dashboard is legitimate; process() decides what zero rows means
+    return extract(page)
 
 
-def scrape(email, password):
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
+def open_dashboard(browser, email, password):
+    """Log in and load the dashboard, retrying once on timeout (Render cold starts)."""
+    for attempt in (1, 2):
+        context = browser.new_context()
+        page = context.new_page()
+        page.set_default_timeout(TIMEOUT_MS)
         try:
-            for attempt in (1, 2):
-                try:
-                    return scrape_once(browser, email, password)
-                except LoginRejected:
-                    sys.exit("Still on /login after submitting: wrong credentials or login selectors "
-                             "(see EMAIL_SELECTOR etc. at the top of check.py)")
-                except PlaywrightTimeout as e:
-                    if attempt == 2:
-                        sys.exit(f"Timed out twice loading the site or dashboard table: {e}")
-                    print("Timed out (Render cold start?), retrying once...")
-        finally:
-            browser.close()
+            login(page, email, password)
+            return page, load_dashboard(page, email, password)
+        except LoginRejected:
+            sys.exit("Still on /login after submitting: wrong credentials or login selectors "
+                     "(see EMAIL_SELECTOR etc. at the top of check.py)")
+        except PlaywrightTimeout as e:
+            context.close()
+            if attempt == 2:
+                sys.exit(f"Timed out twice loading the site or dashboard table: {e}")
+            print("Timed out (Render cold start?), retrying once...")
 
 
 def scrape_fixture(path):
@@ -166,18 +180,9 @@ def send_alert(new, topic):
     resp.raise_for_status()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dry-run", action="store_true", help="print rows; no alert, no seen.json write")
-    parser.add_argument("--fixture", help="parse this local HTML file instead of logging in")
-    args = parser.parse_args()
-
-    topic = None if args.dry_run else env("NTFY_TOPIC")
-    if args.fixture:
-        rows, paginated, has_table = scrape_fixture(args.fixture)
-    else:
-        rows, paginated, has_table = scrape(env("JN_EMAIL"), env("JN_PASSWORD"))
-
+def process(result, dry_run, topic):
+    """Compare scraped rows with seen.json and alert on new ones. Returns True if an alert was sent."""
+    rows, paginated, has_table = result
     if not has_table:
         sys.exit("No job table on the dashboard: the login or page markup probably changed")
     if not rows:
@@ -191,22 +196,63 @@ def main():
     ready = [r for r in rows if r["key"] and is_ready(r)]
     new = list({r["key"]: r for r in ready if r["key"] not in seen}.values())
 
-    print(f"{len(rows)} rows, {len(ready)} ready, {len(new)} new")
-    if args.dry_run:
+    print(f"[{datetime.now(EASTERN):%H:%M:%S} ET] {len(rows)} rows, {len(ready)} ready, {len(new)} new")
+    if dry_run:
         for r in rows:
             mark = "NEW " if r in new else "    "
             print(f"{mark}[{r['status']}] {format_row(r)}  key={r['key']}")
-        return
+        return False
 
+    alerted = False
     if first_run:
         print(f"First run: recorded {len(ready)} jobs without alerting")
     elif new:
         send_alert(new, topic)
         print(f"Sent alert for {len(new)} new job(s)")
+        with open(LAST_ALERT, "w") as f:
+            f.write(datetime.now(EASTERN).date().isoformat() + "\n")
+        alerted = True
 
     with open(SEEN, "w") as f:
         json.dump(sorted(seen | {r["key"] for r in ready}), f, indent=1)
         f.write("\n")
+    return alerted
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dry-run", action="store_true", help="print rows; no alert, no seen.json write")
+    parser.add_argument("--fixture", help="parse this local HTML file instead of logging in")
+    parser.add_argument("--watch", action="store_true",
+                        help="keep reloading the dashboard until the first alert or --until")
+    parser.add_argument("--interval", type=int, default=WATCH_INTERVAL_S, help="seconds between checks in --watch")
+    parser.add_argument("--until", default=WATCH_UNTIL, help="Eastern HH:MM at which --watch stops")
+    args = parser.parse_args()
+
+    topic = None if args.dry_run else env("NTFY_TOPIC")
+    if args.fixture:
+        process(scrape_fixture(args.fixture), args.dry_run, topic)
+        return
+
+    email, password = env("JN_EMAIL"), env("JN_PASSWORD")
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page, result = open_dashboard(browser, email, password)
+        while True:
+            if result and process(result, args.dry_run, topic):
+                break
+            next_check = datetime.now(EASTERN) + timedelta(seconds=args.interval)
+            if not args.watch or next_check.strftime("%H:%M") > args.until:
+                break
+            time.sleep(args.interval)
+            try:
+                result = load_dashboard(page, email, password)
+            except LoginRejected:
+                sys.exit("Session expired and logging in again failed")
+            except PlaywrightTimeout as e:
+                print(f"Reload timed out, will try again next interval: {e}")
+                result = None
+        browser.close()
 
 
 if __name__ == "__main__":
