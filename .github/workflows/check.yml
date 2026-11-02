@@ -10,6 +10,11 @@ on:
     # (11:00-12:30 UTC during EDT, 12:00-13:30 UTC during EST) and the "Gate" step
     # skips any start that isn't inside 7:00-8:30 Eastern.
     - cron: "0,30 11-13 * * 1-5"
+  # GitHub's cron runs hours late on this repo (Oct 29/30 starts landed at 13:18 and 12:56 ET),
+  # so an external scheduler (cron-job.org) POSTs a "watch" dispatch at 7:00 ET. It goes
+  # through the same gate and --watch as a scheduled run; the cron above stays as a backup.
+  repository_dispatch:
+    types: [watch]
   workflow_dispatch: # manual runs skip the gate, so you can test any time
     inputs:
       mock_alert:
@@ -78,7 +83,7 @@ jobs:
           JN_PASSWORD: ${{ secrets.JN_PASSWORD }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         # Scheduled runs watch until the first alert or 8:30 ET; manual runs check once.
-        run: python check.py ${{ github.event_name == 'schedule' && '--watch' || '' }}
+        run: python check.py ${{ github.event_name != 'workflow_dispatch' && '--watch' || '' }}
 
       - name: Commit seen.json if it changed
         if: steps.gate.outputs.run == 'true' && !inputs.mock_alert

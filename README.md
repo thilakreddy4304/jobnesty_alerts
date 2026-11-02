@@ -22,6 +22,16 @@ and the date of the last alert in `last_alert.txt`; the workflow commits both ba
 4. **Secrets:** in the repo, go to Settings → Secrets and variables → Actions → New
    repository secret, and add `JN_EMAIL`, `JN_PASSWORD` and `NTFY_TOPIC`.
 
+5. **Reliable 7:00 start:** GitHub's own cron can run hours late, so trigger the watch
+   from [cron-job.org](https://cron-job.org) (free). Create a fine-grained GitHub token
+   for this repo only with **Contents: Read and write**, then add a cron job:
+   - Schedule: 7:00, Monday-Friday, time zone America/New_York
+   - URL: `https://api.github.com/repos/thilakreddy4304/jobnesty_alerts/dispatches`, method POST
+   - Headers: `Authorization: Bearer <token>`, `Accept: application/vnd.github+json`
+   - Body: `{"event_type": "watch"}`
+
+   A successful call returns 204 and a "repository_dispatch" run appears in the Actions tab.
+
 ## Testing
 
 1. Actions tab → **Check Jobnesty** → **Run workflow**. The first run records the
