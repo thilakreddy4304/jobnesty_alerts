@@ -22,8 +22,8 @@ and the date of the last alert in `last_alert.txt`; the workflow commits both ba
 4. **Secrets:** in the repo, go to Settings → Secrets and variables → Actions → New
    repository secret, and add `JN_EMAIL`, `JN_PASSWORD` and `NTFY_TOPIC`.
 
-5. **Reliable 7:00 start:** GitHub's own cron can run hours late, so trigger the watch
-   from [cron-job.org](https://cron-job.org) (free). Create a fine-grained GitHub token
+5. **7:00 start:** GitHub's own cron ran 5-8 hours late on this repo, so the workflow has
+   no `schedule:` trigger. It's started from [cron-job.org](https://cron-job.org) (free) instead. Create a fine-grained GitHub token
    for this repo only with **Contents: Read and write**, then add a cron job:
    - Schedule: 7:00, Monday-Friday, time zone America/New_York
    - URL: `https://api.github.com/repos/thilakreddy4304/jobnesty_alerts/dispatches`, method POST
@@ -66,14 +66,12 @@ Rows marked `NEW` in the dry-run output are the ones that would trigger an alert
 - **No push but the log says "Sent alert"**: check the topic in the app matches the
   `NTFY_TOPIC` secret exactly, and that iOS notifications are enabled for ntfy.
 - **Want alerts before the resume is ready?** Set `READY_STATUS = None` in `check.py`.
-- **Schedule:** GitHub can't schedule more often than every 5 minutes, so the 2-minute
-  checks happen inside one long run (`check.py --watch`). Cron is UTC and ignores daylight
-  saving, so the workflow fires at :00 and :30 over 11:00-13:30 UTC on weekdays and its
-  "Gate" step skips starts outside 7:00-8:30 Eastern (or after today's alert). The extra
-  starts are backups in case GitHub drops or delays the 7:00 one; while a run is watching
-  they wait in the queue (or show as cancelled) and then skip at the gate.
-  To change the window, edit the `cron:` line, the times in the gate step, and
-  `WATCH_UNTIL` / `WATCH_INTERVAL_S` in `check.py`.
+- **Schedule:** cron-job.org starts one run at 7:00 ET on weekdays, and the 2-minute
+  checks happen inside it (`check.py --watch`). The "Gate" step skips any start outside
+  7:00-8:30 Eastern or after today's alert, so a stray or repeated dispatch is harmless.
+  There is no backup start: if cron-job.org fails, that morning is missed (turn on its
+  failure emails). To change the window, edit the cron-job.org job, the times in the gate
+  step, and `WATCH_UNTIL` / `WATCH_INTERVAL_S` in `check.py`.
 - **Resumes that finish after the alert:** checking stops after the first alert of the
   day, so jobs whose resumes complete later that morning won't push. They'll still be
   on the dashboard, and they'll be included in the next day's alert as "new".

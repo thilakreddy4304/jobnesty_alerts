@@ -1,18 +1,10 @@
 name: Check Jobnesty
 
 on:
-  schedule:
-    # Target: 7:00-8:30 AM Eastern, Monday-Friday. GitHub can't schedule more often than every
-    # 5 minutes, so one run starts at 7:00 and check.py --watch reloads the dashboard every
-    # 2 minutes until the first alert or 8:30. The :30 starts are backups in case GitHub drops
-    # one; while a run is watching they queue, then exit at the gate once it finishes.
-    # Cron is UTC and ignores daylight saving, so this fires over both possible UTC windows
-    # (11:00-12:30 UTC during EDT, 12:00-13:30 UTC during EST) and the "Gate" step
-    # skips any start that isn't inside 7:00-8:30 Eastern.
-    - cron: "0,30 11-13 * * 1-5"
-  # GitHub's cron runs hours late on this repo (Oct 29/30 starts landed at 13:18 and 12:56 ET),
-  # so an external scheduler (cron-job.org) POSTs a "watch" dispatch at 7:00 ET. It goes
-  # through the same gate and --watch as a scheduled run; the cron above stays as a backup.
+  # Target: 7:00-8:30 AM Eastern, Monday-Friday. An external scheduler (cron-job.org) POSTs a
+  # "watch" dispatch at 7:00 ET, and check.py --watch reloads the dashboard every 2 minutes
+  # until the first alert or 8:30. GitHub's own cron isn't used: on this repo it ran 5-8 hours
+  # late (13:18, 12:56 and 15:37 ET), so the gate skipped every start.
   repository_dispatch:
     types: [watch]
   workflow_dispatch: # manual runs skip the gate, so you can test any time
